@@ -1,6 +1,6 @@
 # RAGBot
 RAGBot is an AI-powered chatbot that answers questions about various document formats using the concept of Retrieval-Augmented Generation (RAG). It supports PDFs, DOCX, CSV files, images, and URLs. RAGBot extracts and retrieves relevant information using FAISS for similarity search and provides accurate answers.
-## 🔎 Setup and Installation  
+## Setup and Installation  
 
 1. **Install Ollama:**  
    Download and install Ollama from [Ollama's official website](https://ollama.com/download).  
@@ -27,7 +27,7 @@ RAGBot is an AI-powered chatbot that answers questions about various document fo
 
 ---
 
-Sample Run : 
+## Sample Run : 
 
 ![image](https://github.com/user-attachments/assets/a0b98b2e-28ba-4088-8ebc-fd15432610bc)
 
