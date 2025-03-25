@@ -26,3 +26,8 @@ RAGBot is an AI-powered chatbot that answers questions about various document fo
    ```
 
 ---
+
+Sample Run : 
+
+![image](https://github.com/user-attachments/assets/a0b98b2e-28ba-4088-8ebc-fd15432610bc)
+
