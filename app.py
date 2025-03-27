@@ -1,112 +1,119 @@
 import os
-os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 import time
-import fitz  
-import faiss
-import pickle
-import pytesseract
+import chromadb
 import requests
-import numpy as np
-from bs4 import BeautifulSoup
-from PIL import Image
-from io import BytesIO
-from sentence_transformers import SentenceTransformer
-import streamlit as st
-from docx import Document  
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import streamlit as st
+from llama_index.core import VectorStoreIndex, Document
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.core import Settings
+from typing import Any, List, Generator, AsyncGenerator
+from llama_parse import LlamaParse
+from llama_index.core.llms import LLM, ChatMessage, ChatResponse
+import re
+import aiohttp
+import pyperclip
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-VECTOR_DIM = 384
-EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
-INDEX_FILE = "data/faiss_index.pkl"
-DOC_EMBED_FILE = "data/docs.pkl"
+os.environ["STREAMLIT_WATCHER_TYPE"] = "none"
 os.makedirs("files", exist_ok=True)
-os.makedirs("data", exist_ok=True)
-#Document Ingestion Pipeline
-if os.path.exists(INDEX_FILE) and os.path.exists(DOC_EMBED_FILE):
-    with open(INDEX_FILE, "rb") as f:
-        index = pickle.load(f)
-    with open(DOC_EMBED_FILE, "rb") as f:
-        documents = pickle.load(f)
-else:
-    index = faiss.IndexFlatL2(VECTOR_DIM)
-    documents = []
+os.makedirs("chroma_db", exist_ok=True)
+Settings.embed_model = HuggingFaceEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-def extract_text_chunks(text, chunk_size=1500, overlap=200):
-    chunks = []
-    for i in range(0, len(text), chunk_size - overlap):
-        chunks.append(text[i:i + chunk_size])
-    return chunks
+llama_parse_api_key = os.getenv("LLAMA_PARSE_API_KEY")
+if not llama_parse_api_key:
+    st.error("LlamaParse API key not found. Please set it in the environment variables.")
+    st.stop()
+parser = LlamaParse(api_key=llama_parse_api_key)
 
-def embed_texts(texts):
-    return EMBEDDING_MODEL.encode(texts).tolist()
+class OllamaLLM(LLM):
+    model: str = "mistral"  
 
-def persist_index():
-    with open(INDEX_FILE, "wb") as f:
-        pickle.dump(index, f)
-    with open(DOC_EMBED_FILE, "wb") as f:
-        pickle.dump(documents, f)
+    @property
+    def metadata(self):
+        return {"model": self.model}
 
-def ocr_image(image_file):
-    image = Image.open(image_file)
-    text = pytesseract.image_to_string(image)
-    return text
-
-def fetch_url_text(url):
-    try:
-        res = requests.get(url, timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
-        return soup.get_text()
-    except Exception as e:
-        return f"Failed to fetch URL: {e}"
-
-def extract_docx_text(file_path):
-    doc = Document(file_path)
-    return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-
-@st.cache_data
-def load_csv(file):
-    df = pd.read_csv(file)
-    return df
-
-def process_csv_for_query(df):
-    text = df.to_string()
-    csv_chunks = extract_text_chunks(text)
-    csv_embeds = embed_texts(csv_chunks)
-    index.add(np.array(csv_embeds).astype("float32"))
-    documents.extend(csv_chunks)
-    persist_index()
-
-#Query Pipeline
-def query_ollama(prompt, model="mistral"):
-    try:
+    def complete(self, prompt: str) -> str:
         response = requests.post(
             "http://localhost:11434/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False}
+            json={"model": self.model, "prompt": prompt, "stream": False}
         )
         if response.status_code == 200:
             return response.json().get("response", "No response").strip()
         return "Error from Ollama."
-    except Exception as e:
-        return f"Ollama error: {e}"
 
-# Dashboard Function
-def render_dashboard(df):
-    st.subheader("Data Preview")
+    def stream_complete(self, prompt: str) -> Generator[str, None, None]:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": self.model, "prompt": prompt, "stream": True},
+            stream=True
+        )
+        for line in response.iter_lines():
+            if line:
+                yield line.decode('utf-8')
+
+    def chat(self, messages: List[ChatMessage]) -> ChatResponse:
+        prompt = "\n".join([f"{msg.role}: {msg.content}" for msg in messages]) + "\nAssistant:"
+        response = self.complete(prompt)
+        return ChatResponse(message=ChatMessage(role="assistant", content=response))
+
+    def stream_chat(self, messages: List[ChatMessage]) -> Generator[ChatResponse, None, None]:
+        prompt = "\n".join([f"{msg.role}: {msg.content}" for msg in messages]) + "\nAssistant:"
+        for token in self.stream_complete(prompt):
+            yield ChatResponse(message=ChatMessage(role="assistant", content=token))
+
+    async def acomplete(self, prompt: str) -> str:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "http://localhost:11434/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": False}
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get("response", "No response").strip()
+                return "Error from Ollama."
+
+    async def astream_complete(self, prompt: str) -> AsyncGenerator[str, None]:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "http://localhost:11434/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": True}
+            ) as response:
+                async for line in response.content:
+                    if line:
+                        yield line.decode('utf-8')
+
+    async def achat(self, messages: List[ChatMessage]) -> ChatResponse:
+        prompt = "\n".join([f"{msg.role}: {msg.content}" for msg in messages]) + "\nAssistant:"
+        response = await self.acomplete(prompt)
+        return ChatResponse(message=ChatMessage(role="assistant", content=response))
+
+    async def astream_chat(self, messages: List[ChatMessage]) -> AsyncGenerator[ChatResponse, None]:
+        prompt = "\n".join([f"{msg.role}: {msg.content}" for msg in messages]) + "\nAssistant:"
+        async for token in self.astream_complete(prompt):
+            yield ChatResponse(message=ChatMessage(role="assistant", content=token))
+
+Settings.llm = OllamaLLM()
+
+if "index" not in st.session_state:
+    client = chromadb.PersistentClient(path="./chroma_db")
+    collection = client.get_or_create_collection("ragbot")
+    vector_store = ChromaVectorStore(chroma_collection=collection)
+    st.session_state.index = VectorStoreIndex.from_vector_store(vector_store)
+
+def render_dashboard(df, file_name):
+    st.subheader(f"Data Preview for {file_name}")
     st.write(df.head())
-
     st.subheader("Data Overview")
     st.write(df.describe())
-
     st.subheader("Data Visualizations")
     if st.checkbox("Show Correlation Heatmap"):
         st.write("### Correlation Heatmap")
         plt.figure(figsize=(10, 8))
         sns.heatmap(df.corr(), annot=True, cmap="coolwarm")
         st.pyplot(plt)
-
     numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
     if len(numeric_cols) >= 2:
         st.write("### Select Columns for Scatter Plot")
@@ -116,14 +123,12 @@ def render_dashboard(df):
             plt.figure(figsize=(8, 6))
             sns.scatterplot(x=df[x_col], y=df[y_col], color="blue")
             st.pyplot(plt)
-
     if st.checkbox("Show Histogram"):
         st.write("### Select Column for Histogram")
         hist_col = st.selectbox("Select Column for Histogram", numeric_cols)
         plt.figure(figsize=(8, 6))
         sns.histplot(df[hist_col], kde=True, color="green")
         st.pyplot(plt)
-
     st.subheader("AI-Insights")
     st.write("Analyzing trends using basic AI logic.")
     for col in numeric_cols:
@@ -134,137 +139,126 @@ def render_dashboard(df):
 
 st.set_page_config(page_title="RAGbot", layout="centered")
 st.title("🤖 RAGbot")
-st.caption("Upload and query PDFs, DOCX, Images, URLs, or CSVs")
+st.caption("Chat and attach files to query")
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = set()
+if "pending_prompt" not in st.session_state:
+    st.session_state.pending_prompt = None
 
-# Chat history
-for msg in st.session_state.chat_history:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["message"])
+with st.sidebar:
+    st.write("Chat History")
+    st.button("New Chat", key="new_chat", on_click=lambda: [st.session_state.chat_history.clear(), st.session_state.processed_files.clear()])
+    for i, msg in enumerate(st.session_state.chat_history):
+        with st.expander(f"{msg['role'].capitalize()}: {msg['message'][:30]}..."):
+            st.markdown(msg["message"])
+            st.button("Copy", key=f"copy_history_{i}", on_click=lambda x=msg["message"]: pyperclip.copy(x))
 
+chat_container = st.container()
+with chat_container:
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            if msg["role"] == "assistant":
+                st.markdown(
+                    f"""
+                    <div style="border: 1px solid #ddd; padding: 10px; background-color: #000000; color: #ffffff; font-family: monospace;">
+                    {msg['message']}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                st.button("Copy", key=f"copy_{msg['message'][:10]}_{time.time()}", on_click=lambda x=msg["message"]: pyperclip.copy(x))
+            else:
+                st.markdown(msg["message"])
 
-file_type = st.selectbox("Choose Input Type", ["PDF", "DOCX", "Image", "URL", "CSV"])
-uploaded_file = None
-url_input = ""
-csv_df = None
+user_input = st.chat_input("Ask a question or include a URL to process:")
+uploaded_files = st.file_uploader("📎 Attach Files", accept_multiple_files=True, label_visibility="collapsed")
 
-if file_type == "PDF":
-    uploaded_file = st.file_uploader("📄 Upload PDF", type="pdf")
-elif file_type == "DOCX":
-    uploaded_file = st.file_uploader("📜 Upload DOCX", type="docx")
-elif file_type == "Image":
-    uploaded_file = st.file_uploader("🖼️ Upload Image", type=["png", "jpg", "jpeg"])
-elif file_type == "URL":
-    url_input = st.text_input("🌐 Enter URL to extract content")
-elif file_type == "CSV":
-    uploaded_file = st.file_uploader("📊 Upload CSV", type="csv")
-    if uploaded_file:
-        csv_df = load_csv(uploaded_file)
-        st.success("✅ CSV Loaded.")
-        if st.checkbox("Generate AI Dashboard"):
-            render_dashboard(csv_df)
-        else:
-            process_csv_for_query(csv_df)
-
-if uploaded_file and file_type != "CSV":
-    file_path = os.path.join("files", uploaded_file.name)
-    if not os.path.exists(file_path):
+if uploaded_files:
+    for uploaded_file in uploaded_files:
+        file_path = os.path.join("files", uploaded_file.name)
+        file_key = uploaded_file.name
         with open(file_path, "wb") as f:
             f.write(uploaded_file.read())
-
-        if file_type == "PDF":
-            with st.status("Processing PDF..."):
-                doc = fitz.open(file_path)
-                pdf_text = "\n".join(page.get_text() for page in doc)
-                pdf_chunks = extract_text_chunks(pdf_text)
-                pdf_embeds = embed_texts(pdf_chunks)
-                index.add(np.array(pdf_embeds).astype("float32"))
-                documents.extend(pdf_chunks)
-                persist_index()
-            st.success("✅ PDF processed.")
-
-        elif file_type == "DOCX":
-            with st.status("Processing DOCX..."):
-                docx_text = extract_docx_text(file_path)
-                if docx_text.strip():
-                    docx_chunks = extract_text_chunks(docx_text)
-                    docx_embeds = embed_texts(docx_chunks)
-                    index.add(np.array(docx_embeds).astype("float32"))
-                    documents.extend(docx_chunks)
-                    persist_index()
+        if file_key not in st.session_state.processed_files:
+            if file_path.endswith(".csv"):
+                csv_df = pd.read_csv(file_path)
+                if st.checkbox(f"Generate AI Dashboard for {file_key}"):
+                    render_dashboard(csv_df, file_key)
                 else:
-                    st.warning("❌ No readable text found in DOCX.")
-            st.success("✅ DOCX processed.")
-
-        elif file_type == "Image":
-            with st.status("Extracting text from image..."):
-                image_text = ocr_image(uploaded_file)
-                if image_text.strip():
-                    image_chunks = extract_text_chunks(image_text)
-                    image_embeds = embed_texts(image_chunks)
-                    index.add(np.array(image_embeds).astype("float32"))
-                    documents.extend(image_chunks)
-                    persist_index()
-                else:
-                    st.warning("❌ No readable text found in image.")
-            st.success("✅ Image text extracted.")
-    else:
-        st.info(f"📌 This {file_type} was already processed.")
-
-if url_input:
-    with st.status("Fetching content from URL..."):
-        url_text = fetch_url_text(url_input)
-        if url_text.strip():
-            url_chunks = extract_text_chunks(url_text)
-            url_embeds = embed_texts(url_chunks)
-            index.add(np.array(url_embeds).astype("float32"))
-            documents.extend(url_chunks)
-            persist_index()
-        else:
-            st.warning("❌ No text found at the URL.")
-    st.success("✅ URL content added.")
-
-
-if user_input := st.chat_input(f"Ask a question about your {file_type} (or CSV if not dashboard):"):
-    st.session_state.chat_history.append({"role": "user", "message": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Assistant is thinking..."):
-            if len(documents) == 0:
-                st.warning(f"⚠️ Please upload a {file_type} or process a CSV for querying before asking.")
+                    with st.status(f"Processing {file_key}..."):
+                        parsed_data = parser.load_data(file_path)
+                        for item in parsed_data:
+                            doc = Document(text=item.text, metadata={"source": file_path})
+                            st.session_state.index.insert(doc)
+                        st.session_state.processed_files.add(file_key)
+                    st.success(f"✅ {file_key} processed and stored.")
             else:
-                query_vec = EMBEDDING_MODEL.encode([user_input])
-                D, I = index.search(np.array(query_vec).astype("float32"), k=3)
+                with st.status(f"Processing {file_key}..."):
+                    parsed_data = parser.load_data(file_path)
+                    for item in parsed_data:
+                        doc = Document(text=item.text, metadata={"source": file_path})
+                        st.session_state.index.insert(doc)
+                    st.session_state.processed_files.add(file_key)
+                st.success(f"✅ {file_key} processed and stored.")
 
-                top_chunks = [documents[i] for i in I[0] if i < len(documents)]
-                context = "\n\n".join(top_chunks)
-
-                previous_qna = "\n".join(
-                    [f"User: {m['message']}" if m["role"] == "user" else f"Assistant: {m['message']}"
-                     for m in st.session_state.chat_history[-6:]]
+if user_input:
+    st.session_state.pending_prompt = user_input
+    with chat_container:
+        st.session_state.chat_history.append({"role": "user", "message": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        with st.chat_message("assistant"):
+            with st.spinner("Assistant is thinking..."):
+                url_pattern = r'(https?://\S+)'
+                urls = re.findall(url_pattern, user_input)
+                for url in urls:
+                    if url not in st.session_state.processed_files:
+                        with st.status(f"Fetching content from {url}..."):
+                            doc = Document(text=requests.get(url).text, metadata={"source": url})
+                            st.session_state.index.insert(doc)
+                            st.session_state.processed_files.add(url)
+                        st.write(f"- {url} (URL processed)")
+                retriever = st.session_state.index.as_retriever(similarity_top_k=3)
+                retrieved_nodes = retriever.retrieve(user_input)
+                context_str = "\n\n".join([node.text for node in retrieved_nodes])
+                previous_qna = "\n\n".join(
+                    [f"{m['role'].capitalize()}: {m['message']}" for m in st.session_state.chat_history[-6:]]
                 )
                 prompt = f"""You are a helpful assistant answering questions from document/image/web/csv content.
 
 Context:
-{context}
+{context_str}
 
 Conversation History:
 {previous_qna}
 
 User: {user_input}
 Assistant:"""
-
-                response = query_ollama(prompt)
-
+                response = Settings.llm.complete(prompt)
                 placeholder = st.empty()
                 streamed = ""
                 for word in response.split():
                     streamed += word + " "
-                    placeholder.markdown(streamed + "▌")
+                    placeholder.markdown(
+                        f"""
+                        <div style="border: 1px solid #ddd; padding: 10px; background-color: #000000; color: #ffffff; font-family: monospace;">
+                        {streamed}▌
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
                     time.sleep(0.03)
-                placeholder.markdown(streamed)
-
+                placeholder.markdown(
+                    f"""
+                    <div style="border: 1px solid #ddd; padding: 10px; background-color: #000000; color: #ffffff; font-family: monospace;">
+                    {streamed}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                st.button("Copy", key=f"copy_response_{time.time()}", on_click=lambda x=streamed: pyperclip.copy(x))
                 st.session_state.chat_history.append({"role": "assistant", "message": streamed})
+    st.session_state.pending_prompt = None
